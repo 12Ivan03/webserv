@@ -1,10 +1,6 @@
 #include "./hpp/ServerConfig.hpp"
 #include "HelperFunctions.hpp"
 
-//	LOCATION CONFIG
-
-//  SERVER CONFIG 
-
 ServerConfig::ServerConfig() :_host("0.0.0.0"), _port(8080), _server_name({"localhost"}), _root({"./site/www"}), _index({"index.html"}), _client_max_body_size({1000000}) {};
 
 ServerConfig::~ServerConfig() {};
@@ -30,8 +26,6 @@ static bool validServerName(const std::string& name) {
 
 void ServerConfig::setPort(const std::vector<std::string>& port) {
 
-	// _port.pop_back();
-	// std::cout << "Setport -> " << port.size() << "post var --> " << port[0] << port[1] << std::endl;
 	if (port.size() != 1)
 		throw std::runtime_error("Incorrect port");
 
@@ -121,7 +115,6 @@ void ServerConfig::setIndex(const std::vector<std::string>& index_name) {
 
 void ServerConfig::setClientMaxBodySize(const std::vector<std::string>& client_max_body_size) {
 
-	// char *end;
 	errno = 0;
 
 	if (client_max_body_size.size() != 1)
@@ -167,8 +160,6 @@ const std::string& ServerConfig::getHost() const { return _host; }
 
 const int& ServerConfig::getPort() const { return _port; };
 
-// const std::vector<LocationConfig>& ServerConfig::getLocations() const { return _locations; };
-
 const std::vector<std::string>& ServerConfig::getServerName() const { return _server_name; };
 
 const std::vector<std::string>& ServerConfig::getRoot() const { return _root; };
@@ -196,9 +187,34 @@ std::string ServerConfig::getOneErrorPage(int code) const {
 
 const int& ServerConfig::getServerConfFD() const { return _serverConf_fd; };
 
-// Added by Alina for Location block
 void ServerConfig::addLocation(const LocationConfig &locations) {
 		
+	for (size_t i = 0; i < _locations.size(); ++i)
+	{
+		const LocationConfig& current = _locations[i];
+
+		if (current.getUriPath() != locations.getUriPath())
+			continue;
+
+		bool currentIsCgi = current.hasCgiConfig();
+		bool newIsCgi = locations.hasCgiConfig();
+
+		if (!currentIsCgi && !newIsCgi)
+			throw std::runtime_error("Incorrect config file");
+
+		if (currentIsCgi && newIsCgi)
+		{
+			const std::vector<std::string>& extensions =
+				locations.getCgiExtension();
+
+			for (size_t j = 0; j < extensions.size(); ++j)
+			{
+				if (current.hasCgiExtension(extensions[j]))
+					throw std::runtime_error("Incorrect config file");
+			}
+		}
+	}
+
 	_locations.push_back(locations);
 };
 

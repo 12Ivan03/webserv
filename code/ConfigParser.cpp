@@ -3,7 +3,6 @@
 #include "./hpp/LocationConfig.hpp"
 
 ConfigParser::ConfigParser() {
-	// Dispatch table or setter map
 	setters["listen"] = &ServerConfig::setPort;
 	setters["server_name"] = &ServerConfig::setServerName;
 	setters["root"] = &ServerConfig::setRoot;
@@ -19,6 +18,7 @@ ConfigParser::ConfigParser() {
 	locationSetters["cgi_extension"] = &LocationConfig::setCgiExtension;
 	locationSetters["cgi_path"] = &LocationConfig::setCgiPath;
 	locationSetters["return"] = &LocationConfig::setRedirect;
+	locationSetters["client_max_body_size"] = &LocationConfig::setClientMaxBodySize;
 }
 
 const std::vector<ServerConfig>& ConfigParser::getServers() const {
@@ -62,23 +62,21 @@ void ConfigParser::parse(const std::string& filename)
 {
 
 	std::ifstream file(filename.c_str());
-	// check currect file
 
 	if (!file) {
 		throw std::runtime_error("Cannot open config file");
 	}
-	
+
 	std::vector<std::string> configTokens = tokenize(file);
 
 	for (size_t i = 0; i < configTokens.size(); i++) {
 
 		if (configTokens[i] == "server" && i + 1 < configTokens.size() && configTokens[i + 1] == "{") {
-			
+
 			ServerConfig server;
 			i += 2;
 
 			while (i < configTokens.size() && configTokens[i] != "}") {
-
 
 				if (configTokens[i] == "location") {
 
@@ -102,6 +100,7 @@ void ConfigParser::parse(const std::string& filename)
 						throw std::runtime_error("Missing closing brace for location");
 
 					location.setUriPath(uripath);
+					location.validateCgiConfig();
 					server.addLocation(location);
 					i++;
 				} else {
@@ -112,6 +111,24 @@ void ConfigParser::parse(const std::string& filename)
 
 			if (i >= configTokens.size() || configTokens[i] != "}")
 				throw std::runtime_error("Missing closing brace for server");
+
+			for (const ServerConfig& existing : servers) {
+
+				if (existing.getPort() != server.getPort())
+					continue;
+
+				const std::string& existingHost = existing.getHost();
+				const std::string& newHost = server.getHost();
+
+				if (existingHost != newHost &&
+					(existingHost == "0.0.0.0" || newHost == "0.0.0.0")) {
+
+					throw std::runtime_error(
+						"Overlapping listen addresses on port " +
+						std::to_string(server.getPort())
+					);
+				}
+			}
 
 			servers.push_back(server);
 		} else {

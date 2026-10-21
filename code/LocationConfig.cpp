@@ -1,5 +1,9 @@
 #include "./hpp/LocationConfig.hpp"
 #include "HelperFunctions.hpp"
+#include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <climits>
 
 LocationConfig::LocationConfig()
 	: _uriPath(),
@@ -10,7 +14,9 @@ LocationConfig::LocationConfig()
 	  _indpaths(),
 	  _cgi_extensions(),
 	  _cgi_paths(),
-	  _redir()
+	  _redir(),
+	  _clientMaxBodySize(0),
+	  _hasClientMaxBodySize(false)
 {
 	_methods.get = false;
 	_methods.post = false;
@@ -24,7 +30,6 @@ void LocationConfig::setUriPath(std::string uripath) {
 	if (!checkUriPath(uripath))
 		throw std::runtime_error("Incorrect URI path");
 	_uriPath = uripath;
-	// printDebug("\n_uriPath: ", _uriPath);
 }
 
 void LocationConfig::setAllowMethods(const std::vector<std::string>& methods) {
@@ -43,9 +48,6 @@ void LocationConfig::setAllowMethods(const std::vector<std::string>& methods) {
 		else
 			throw std::runtime_error("Unknown Allow methods in configuration file");
 	}
-	// printDebug("_methods.get > ", _methods.get);
-	// printDebug("_methods.post > ", _methods.post);
-	// printDebug("_methods.del > ", _methods.del);
 };
 
 void LocationConfig::setUploadStore(const std::vector<std::string>& fspath){
@@ -54,18 +56,15 @@ void LocationConfig::setUploadStore(const std::vector<std::string>& fspath){
 		throw std::runtime_error("Incorrect Upload store in configuration file");
 		
 	_upload_store = fspath[0];
-	// printDebug("_upload_store > ", _upload_store);
 };
 
 void LocationConfig::setAutoIndex(const std::vector<std::string>& indexes){
 
-	// if (indexes.size() != 1 || !checkFSPath(indexes[0]))
 	if (indexes.size() != 1 || (indexes[0] != "on" && indexes[0] != "off"))
 
 		throw std::runtime_error("Incorrect AutoIndex in configuration file");
 		
 	_autoIndex = indexes[0] == "on";
-	// printDebug("_autoIndex > ", _autoIndex);
 };
 
 void LocationConfig::setRoot(const std::vector<std::string>& fspath){
@@ -74,7 +73,6 @@ void LocationConfig::setRoot(const std::vector<std::string>& fspath){
 		throw std::runtime_error("Incorrect root in location");
 		
 	_rootPath = fspath[0];
-	// printDebug("_rootPath > ", _rootPath);
 };
 
 void LocationConfig::setIndex(const std::vector<std::string>& indpaths){
@@ -89,17 +87,21 @@ void LocationConfig::setIndex(const std::vector<std::string>& indpaths){
 	}
 		
 	_indpaths.insert(_indpaths.end(), indpaths.begin(), indpaths.end());
-	// printDebug("_indexes: ", _indpaths);
 };
 
 void LocationConfig::setCgiExtension(const std::vector<std::string>& cgiexs){
-	// Validate each extension
+	if (cgiexs.empty())
+		throw std::runtime_error("Missing CGI extensions in configuration file");
+
 	for (const std::string& ext : cgiexs) {
-		if (ext.empty() || ext[0] != '.' || ext.find('/') != std::string::npos || ext.find(' ') != std::string::npos)
+		if (ext.size() < 2 || ext[0] != '.' || ext.find('/') != std::string::npos || ext.find(' ') != std::string::npos)
 			throw std::runtime_error("Invalid CGI extension in configuration file");
 	}
+	for (size_t i = 0; i < cgiexs.size(); ++i) {
+		if (std::find(cgiexs.begin(), cgiexs.begin() + i, cgiexs[i]) != cgiexs.begin() + i)
+			throw std::runtime_error("Duplicate CGI extension in configuration file");
+	}
 	_cgi_extensions = cgiexs;
-	// printDebug("_cgi_extensions > ", _cgi_extensions);
 	if (!_cgi_paths.empty() && _cgi_paths.size() != _cgi_extensions.size())
 		throw std::runtime_error("CGI extensions and CGI paths count mismatch");
 }
@@ -112,13 +114,24 @@ void LocationConfig::setCgiPath(const std::vector<std::string>& cgipath)
 	if (!_cgi_extensions.empty() && cgipath.size() != _cgi_extensions.size())
 		throw std::runtime_error("CGI extensions and CGI paths count mismatch");
 
+	std::vector<std::string> validatedPaths;
 	for (const std::string& path : cgipath)
 	{
 		if (!checkFSPath(path))
 			throw std::runtime_error("Incorrect CGI path in configuration file");
-		_cgi_paths.push_back(path);
+		struct stat status;
+		if (stat(path.c_str(), &status) != 0 || !S_ISREG(status.st_mode)
+			|| access(path.c_str(), X_OK) != 0)
+			throw std::runtime_error("CGI interpreter must be an executable regular file: " + path);
+		validatedPaths.push_back(std::filesystem::absolute(path).lexically_normal().string());
 	}
-	// printDebug("_cgi_paths > ", _cgi_paths);
+	_cgi_paths = validatedPaths;
+}
+
+void LocationConfig::validateCgiConfig() const
+{
+	if (_cgi_extensions.size() != _cgi_paths.size())
+		throw std::runtime_error("Location " + _uriPath + ": cgi_extension and cgi_path must be paired");
 }
 
 void LocationConfig::setRedirect(const std::vector<std::string>& redirpath){
@@ -139,9 +152,6 @@ void LocationConfig::setRedirect(const std::vector<std::string>& redirpath){
 	
 	_redir._number = statusCode;
 	_redir._redirPath = redirpath[1];
-
-	// printDebug("_redir._number > ", _redir._number);
-	// printDebug("_redir._redirPath > ", _redir._redirPath);
 }
 
 const std::string& LocationConfig::getUriPath() const
@@ -164,6 +174,21 @@ bool LocationConfig::hasRedirect() const
 	return _redir._number != 0;
 }
 
+bool LocationConfig::hasCgiConfig() const
+{
+	return !_cgi_extensions.empty();
+}
+
+bool LocationConfig::hasCgiExtension(const std::string& extension) const
+{
+	for (size_t i = 0; i < _cgi_extensions.size(); ++i)
+	{
+		if (_cgi_extensions[i] == extension)
+			return true;
+	}
+	return false;
+}
+
 const std::string& LocationConfig::getUploadStore() const
 {
 	return _upload_store;
@@ -177,6 +202,11 @@ const std::string& LocationConfig::getRoot() const
 const std::vector<std::string>& LocationConfig::getIndex() const
 {
 	return _indpaths;
+}
+
+const std::vector<std::string>& LocationConfig::getCgiPath() const
+{
+	return _cgi_paths;
 }
 
 const std::vector<std::string>& LocationConfig::getCgiExtension() const
@@ -199,4 +229,32 @@ bool LocationConfig::isPostAllowed() const {
 
 bool LocationConfig::isDeleteAllowed() const {
 	return _methods.del;
+}
+
+void LocationConfig::setClientMaxBodySize(const std::vector<std::string>& client_max_body_size) {
+	
+	errno = 0;
+
+	if (client_max_body_size.size() != 1)
+		throw std::runtime_error("client_max_body_size expects exactly one value");
+	
+	if (!check_num(client_max_body_size[0])) {
+		throw std::runtime_error("Invalid client_max_body_size");
+	}
+
+	unsigned long long int value = std::strtoull(client_max_body_size[0].c_str(), NULL, 10);
+
+	if (errno == ERANGE || value > UINT_MAX)
+		throw std::runtime_error("Invalid client_max_body_size number");
+
+	_clientMaxBodySize = static_cast<unsigned int>(value);
+	_hasClientMaxBodySize = true;
+}
+
+unsigned int LocationConfig::getClientMaxBodySize() const {
+	return _clientMaxBodySize;
+}
+
+bool LocationConfig::hasClientMaxBodySize() const {
+	return _hasClientMaxBodySize;
 }

@@ -25,6 +25,102 @@ int HTTPResponseBuild::prepareRequestPath(const HTTPRequest &request, const Serv
 	return 0;
 }
 
+bool HTTPResponseBuild::resolveCgiRoute(const HTTPRequest& request, const ServerConfig& servConf,
+	CgiRoute& route, int& errorCode, const LocationConfig*& location)
+{
+	std::string path;
+	errorCode = 0;
+
+	int result = prepareRequestPath(request, servConf, path, location);
+	if (result != 0) {
+		errorCode = result;
+		return false;
+	}
+
+	if (location->hasRedirect())
+		return false;
+
+	// Begin of the new block
+	const std::string extension = getPathExtension(path);
+
+	if (extension.empty() || !location->hasCgiExtension(extension))
+		return false;
+
+	Method method = request.getMethod();
+
+	if ((method == Method::GET && !location->isGetAllowed()) ||
+		(method == Method::POST && !location->isPostAllowed()) ||
+		(method == Method::DELETE && !location->isDeleteAllowed()))
+	{
+		errorCode = 405;
+		return false;
+	}
+	// End of the new block
+
+	const std::vector<std::string>& extensions = location->getCgiExtension();
+	const std::vector<std::string>& cgiPaths = location->getCgiPath();
+	const auto matched = std::find(extensions.begin(), extensions.end(), extension);
+	if (matched == extensions.end())
+		return false;
+	const size_t cgiIndex = static_cast<size_t>(matched - extensions.begin());
+	if (cgiIndex >= cgiPaths.size()) {
+		errorCode = 500;
+		return false;
+	}
+
+	std::string baseDir;
+	std::string fullPath;
+	std::string relativePath = path;
+
+	if (path.compare(0, location->getUriPath().size(), location->getUriPath()) == 0)
+		relativePath = path.substr(location->getUriPath().size());
+
+	if (!location->getRoot().empty())
+	{
+		baseDir = location->getRoot();
+		fullPath = joinPath(location->getRoot(), relativePath);
+	}
+	else
+	{
+		if (servConf.getRoot().empty() || servConf.getRoot()[0].empty()) {
+			errorCode = 500;
+			return false;
+		}
+
+		baseDir = servConf.getRoot()[0];
+		fullPath = joinPath(servConf.getRoot()[0], path);
+	}
+
+	std::error_code ec;
+	const std::filesystem::file_status status = std::filesystem::status(fullPath, ec);
+	if (ec || !std::filesystem::exists(status)) {
+		if (!ec || ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory)
+			errorCode = 404;
+		else if (ec == std::errc::permission_denied)
+			errorCode = 403;
+		else
+			errorCode = 500;
+		return false;
+	}
+	if (!pathInsideBase(baseDir, fullPath)) {
+		errorCode = 403;
+		return false;
+	}
+	if (!std::filesystem::is_regular_file(status)) {
+		errorCode = 404;
+		return false;
+	}
+	if (!canReadFile(fullPath)) {
+		errorCode = 403;
+		return false;
+	}
+
+	route.scriptPath = fullPath;
+	route.cgiPath = cgiPaths[cgiIndex];
+	const size_t scriptSlash = fullPath.find_last_of('/');
+	route.workingDirectory = scriptSlash == std::string::npos ? "." : fullPath.substr(0, scriptSlash);
+	return true;
+}
 
 HTTPResponse HTTPResponseBuild::build(const HTTPRequest &request, const ServerConfig &servConf) {
 
@@ -38,7 +134,7 @@ HTTPResponse HTTPResponseBuild::build(const HTTPRequest &request, const ServerCo
 
 	int errorCode = prepareRequestPath(request, servConf, path, location);
 
-	if(errorCode != 0) 
+	if(errorCode != 0)
 		return makeErrorResponse(errorCode, request, servConf);
 
 	if (location->hasRedirect()) {
@@ -75,12 +171,7 @@ HTTPResponse HTTPResponseBuild::build(const HTTPRequest &request, const ServerCo
 
 // GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET GET
 
-HTTPResponse HTTPResponseBuild::handleGet(
-	const HTTPRequest &request, 
-	const ServerConfig &servConf, 
-	std::string &path,  
-	const LocationConfig *&location)
-{
+HTTPResponse HTTPResponseBuild::handleGet(const HTTPRequest &request, const ServerConfig &servConf, std::string &path,  const LocationConfig *&location) {
 
 	HTTPResponse res;
 
@@ -154,6 +245,7 @@ HTTPResponse HTTPResponseBuild::handleGet(
 };
 
 // POST POST POST POST POST POST POST POST POST POST POST POST POST POST POST POST  POST POST POST POST POST POST POST POST  POST POST POST POST POST
+
 HTTPResponse HTTPResponseBuild::handlePost(
 	const HTTPRequest &request,
 	const ServerConfig &servConf, 
@@ -170,7 +262,10 @@ HTTPResponse HTTPResponseBuild::handlePost(
 
 	const std::string &uploadStore = location->getUploadStore();
 
-	if (uploadStore.empty() || !isDirectory(uploadStore) || access(uploadStore.c_str(), W_OK | X_OK) != 0)
+	if (uploadStore.empty())
+		return makeErrorResponse(403, request, servConf);
+
+	if (!isDirectory(uploadStore) || access(uploadStore.c_str(), W_OK | X_OK) != 0)
 	{
 		return makeErrorResponse(500, request, servConf);
 	}
@@ -189,10 +284,6 @@ HTTPResponse HTTPResponseBuild::handlePost(
 		return makeErrorResponse(400, request, servConf);
 	}
 
-	/*
-	 * Determine which part of the current request body
-	 * must be saved.
-	 */
 	size_t dataOffset = bodyOffset;
 	size_t dataSize = bodySize;
 	std::string filename;
@@ -248,73 +339,53 @@ HTTPResponse HTTPResponseBuild::handlePost(
 	{
 		std::ostringstream name;
 
-		name << "upload-"
-			 << std::time(NULL)
-			 << "-"
-			 << getpid();
-
-		filename = name.str();
+		static unsigned long sequence = 0;
+		do {
+			name.str("");
+			name.clear();
+			name << "upload-" << std::time(NULL) << "-" << getpid() << "-" << ++sequence;
+			filename = name.str();
+		} while (fileExists(joinPath(uploadStore, filename)));
 	}
 
 	const std::string outputPath =
 		joinPath(uploadStore, filename);
 
-	const int outputFd = open(
-		outputPath.c_str(),
-		O_WRONLY | O_CREAT | O_TRUNC,
-		0644);
-
-	if (outputFd < 0)
+	std::ofstream output(outputPath.c_str(), std::ios::binary | std::ios::trunc);
+	if (!output)
 		return makeErrorResponse(500, request, servConf);
 
-	size_t written = 0;
-
-	while (written < dataSize)
-	{
-		ssize_t result = write(
-			outputFd,
-			requestBuffer.data() + dataOffset + written,
-			dataSize - written);
-
-		if (result < 0 && errno == EINTR)
-			continue;
-
-		if (result <= 0)
-		{
-			close(outputFd); 
-			std::error_code ec;
-			std::filesystem::remove(outputPath, ec);
-
-			return makeErrorResponse(500, request, servConf);
-		}
-
-		written += static_cast<size_t>(result);
+	output.write(requestBuffer.data() + dataOffset, static_cast<std::streamsize>(dataSize));
+	output.close();
+	if (!output) {
+		std::error_code ec;
+		std::filesystem::remove(outputPath, ec);
+		return makeErrorResponse(500, request, servConf);
 	}
-
-	close(outputFd);
 
 	HTTPResponse res;
 
-	std::string body =
-		readReadFile("./site/www/post-result.html");
+	std::string body = "<!DOCTYPE html>"
+		"<html>"
+		"<head><title>201 Created</title></head>"
+		"<body>"
+		"<h1>201 Created</h1>"
+		"<p>Upload successful.</p>"
+		"</body>"
+		"</html>";
 
 	res.setStatusCode(201);
 	res.setStatus(getStatusText(201));
 	res.setVersion(request.getVersion());
 	res.setHeader(
 		"Content-Type",
-		getContentType("./site/www/post-result.html"));
+		"text/html");
 	res.setHeader(
 		"Content-Length",
 		std::to_string(body.size()));
 	res.setHeader(
 		"Connection",
 		decideConnection(request));
-	res.setHeader(
-		"Location",
-		joinPath(
-			location->getUriPath(),
-			filename));
 	res.setBody(body);
 
 	return res;
@@ -383,13 +454,10 @@ HTTPResponse HTTPResponseBuild::handleDelete(
 		return makeErrorResponse(404, request, servConf);
 
 	HTTPResponse res;
-	// std::string body = readReadFile("./site/www/delete_page/index.html");
-
 	res.setStatusCode(204);
 	res.setStatus(getStatusText(204));
 	res.setHeader("Content-Type", getContentType(fullPath));
-	// res.setHeader("Content-Length", std::to_string(body.size())); // send body for successful deleting file...
-	res.setHeader("Content-Length", "0"); // send body for successful deleting file...
+	res.setHeader("Content-Length", "0");
 	res.setHeader("Connection", decideConnection(request));
 	res.setVersion(request.getVersion());
 	res.setBody("");
@@ -470,14 +538,12 @@ HTTPResponse HTTPResponseBuild::makeEarlyErrorResponse(int code, const ServerCon
 	HTTPRequest errRequest;
 
 	errRequest.setVersion("1.1");
-	errRequest.addHeader("Connection", "close");
+	errRequest.addHeader("connection", "close");
 
 	return makeErrorResponse(code, errRequest, servConf);
 };
 
 std::string HTTPResponseBuild::buildErrorBody(int code, const ServerConfig &servConf) {
-
-	std::string error_message = getStatusText(code);
 
 	if (servConf.hasErrorPage(code)) {
 
@@ -486,30 +552,33 @@ std::string HTTPResponseBuild::buildErrorBody(int code, const ServerConfig &serv
 		std::string fullPath = joinPath(root, error_path);
 
 		try {
-
 			if (fileExists(fullPath) && canReadFile(fullPath)) {
 				return readReadFile(fullPath);
 			}
 		} catch (const std::exception &e) {
 			std::cerr << "Could not read custom error page " << error_path << ": " << e.what() << std::endl;
 		}
-
-		return "<!DOCTYPE html>\n"
-			   "<html>\n"
-			   "<head><title>" +
-			   std::to_string(code) + " " + error_message +
-			   "</title></head>\n"
-			   "<body>\n"
-			   "<h1>" +
-			   std::to_string(code) + " " + error_message + "</h1>\n"
-															"</body>\n"
-															"</html>\n";
+		return makeFallBackErrorBody(code);
 	}
+
+	return makeFallBackErrorBody(code);
+}
+
+std::string HTTPResponseBuild::makeFallBackErrorBody(int code) {
 
 	std::string text = getStatusText(code);
 
-	return readReadFile("./site/www/error_pages/index.html");
-};
+	return "<!DOCTYPE html>\n"
+			   "<html>\n"
+			   "<head><title>" +
+			   std::to_string(code) + " " + text +
+			   "</title></head>\n"
+			   "<body>\n"
+			   "<h1>" +
+			   std::to_string(code) + " " + text + "</h1>\n"
+															"</body>\n"
+															"</html>\n";
+}
 
 std::string HTTPResponseBuild::getStatusText(int code) 
 {
@@ -518,6 +587,10 @@ std::string HTTPResponseBuild::getStatusText(int code)
 		case 201: return "Created";
 		case 204: return "No Content";
 		case 301: return "Moved Permanently";
+		case 302: return "Found";
+		case 303: return "See Other";
+		case 307: return "Temporary Redirect";
+		case 308: return "Permanent Redirect";
 		case 400: return "Bad Request";
 		case 403: return "Forbidden";
 		case 404: return "Not Found";
@@ -554,9 +627,7 @@ std::string HTTPResponseBuild::decideConnection(const HTTPRequest &request) {
 	return "close";
 };
 
-// HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER
-
-//  AUTO INDEX
+// HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER HELPER
 
 HTTPResponse HTTPResponseBuild::buildAutoIndexPage(const HTTPRequest &request, const ServerConfig &servConf, const std::string &fullPath, const std::string &requestPath) {
 
@@ -584,7 +655,6 @@ HTTPResponse HTTPResponseBuild::buildAutoIndexPage(const HTTPRequest &request, c
 
 	while ((entry = readdir(dir)) != NULL) {
 		std::string name = entry->d_name;
-		// std::cout << "\t\t name --> " << name << std::endl;
 
 		if (name == "." || name == ".." || name.front() == '.')
 			continue;
@@ -622,25 +692,58 @@ HTTPResponse HTTPResponseBuild::buildAutoIndexPage(const HTTPRequest &request, c
 	return res;
 }
 
-const LocationConfig *HTTPResponseBuild::findBestLocation(const std::string &path, const ServerConfig &servConf) {
+const LocationConfig *HTTPResponseBuild::findBestLocation(
+	const std::string &path,
+	const ServerConfig &servConf)
+{
+	const std::vector<LocationConfig>& locations = servConf.getLocations();
 
-	const std::vector<LocationConfig> &locations = servConf.getLocations();
+	const LocationConfig* normalLoc = NULL;
+	const LocationConfig* cgiLoc = NULL;
 
-	const LocationConfig *bestLoc = NULL;
+	size_t bestLength = 0;
+	std::string extension = getPathExtension(path);
 
-	for (const auto &loc : locations) {
-		if (startsWithLocation(path, loc.getUriPath()))
+	for (size_t i = 0; i < locations.size(); ++i)
+	{
+		const LocationConfig& loc = locations[i];
+
+		if (!startsWithLocation(path, loc.getUriPath()))
+			continue;
+
+		bool isMatchingCgi = false;
+
+		if (loc.hasCgiConfig())
 		{
-			if (!bestLoc || loc.getUriPath().size() > bestLoc->getUriPath().size())
-				bestLoc = &loc;
+			if (extension.empty() || !loc.hasCgiExtension(extension))
+				continue;
+
+			isMatchingCgi = true;
 		}
+
+		size_t currentLength = loc.getUriPath().size();
+
+		if (currentLength > bestLength)
+		{
+			bestLength = currentLength;
+			normalLoc = NULL;
+			cgiLoc = NULL;
+		}
+		else if (currentLength < bestLength)
+			continue;
+
+		if (isMatchingCgi)
+			cgiLoc = &loc;
+		else
+			normalLoc = &loc;
 	}
 
-	if (bestLoc == NULL)
-		return NULL;
+	if (cgiLoc != NULL)
+		return cgiLoc;
 
-	return bestLoc;
-};
+	return normalLoc;
+}
+
 
 bool HTTPResponseBuild::startsWithLocation(const std::string &path, const std::string &loc) {
 
@@ -697,7 +800,7 @@ bool HTTPResponseBuild::isDirectory(const std::string &path)
 	if (stat(path.c_str(), &st) != 0)
 		return false;
 
-	return S_ISDIR(st.st_mode); // S_ISDIR(st.st_mode) asks -> "Do the type bits inside st_mode indicate a directory?"
+	return S_ISDIR(st.st_mode);
 }
 
 std::string HTTPResponseBuild::findIndexFile(std::string fullPath, const LocationConfig &location, const ServerConfig &servConf) {
@@ -782,6 +885,21 @@ std::string HTTPResponseBuild::getContentType(const std::string &contenPath)
 	return "application/octet-stream";
 }
 
+
+std::string HTTPResponseBuild::getPathExtension(const std::string& path)
+{
+	size_t dot = path.find_last_of('.');
+	size_t slash = path.find_last_of('/');
+
+	if (dot == std::string::npos)
+		return "";
+
+	if (slash != std::string::npos && dot < slash)
+		return "";
+
+	return path.substr(dot);
+}
+
 bool HTTPResponseBuild::containsParentTraversal(const std::string &path)
 {
 	std::stringstream stream(path);
@@ -852,4 +970,18 @@ std::string HTTPResponseBuild::urlDecoder(std::string urlPath) {
 		}
 	}
 	return decodedUrl;
+}
+
+const LocationConfig* HTTPResponseBuild::getLocationForPath(
+	const std::string& path,
+	const ServerConfig& servConf)
+{
+	try
+	{
+		return findBestLocation(urlDecoder(path), servConf);
+	}
+	catch (const std::exception&)
+	{
+		return NULL;
+	}
 }

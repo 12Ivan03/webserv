@@ -9,6 +9,8 @@
 #include "HTTPParseException.hpp"
 #include "MultipartParser.hpp"
 #include "MultipartPart.hpp"
+#include "../code/hpp/ServerManager.hpp"
+#include "../code/hpp/ClientData.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -71,7 +73,6 @@ void testLocationConfig()
 	check(location.isGetAllowed() && location.isPostAllowed(), "configured methods are enabled");
 	check(!location.isDeleteAllowed(), "unconfigured methods stay disabled");
 	check(location.getRoot() == "./site/www", "location root is stored");
-	// check(location.getIndex().size() == 2, "location indexes are stored");
 	check(location.getAutoIndex(), "autoindex on is stored");
 	check(location.hasRedirect() && location.getRedirect()._number == 301,
 		  "redirect is stored");
@@ -176,6 +177,112 @@ void testConfigParser()
 	check(servers.at(0).getLocations().at(1).isPostAllowed(), "location methods are parsed");
 	checkThrows([] { ConfigParser().parse("tests/fixtures/invalid.conf"); },
 				"unknown directives are rejected");
+}
+
+void testCgiConfigurationValidation()
+{
+	char directoryTemplate[] = "/tmp/webserv-cgi-config-XXXXXX";
+	char* directory = mkdtemp(directoryTemplate);
+	check(directory != NULL, "CGI configuration fixture directory is created");
+	if (!directory)
+		return;
+	const std::string base(directory);
+	const std::string interpreter = base + "/interpreter";
+	std::ofstream(interpreter) << "#!/bin/sh\nexit 0\n";
+	chmod(interpreter.c_str(), 0700);
+	const std::string config = base + "/test.conf";
+	const auto parseDirectives = [&](const std::string& directives) {
+		std::ofstream file(config);
+		file << "server { listen 8088; location /cgi-bin { allow_methods GET POST; "
+			 << directives << " } }\n";
+		file.close();
+		ConfigParser parser;
+		parser.parse(config);
+	};
+	parseDirectives("cgi_extension .py; cgi_path " + interpreter + ";");
+	parseDirectives("cgi_path " + interpreter + "; cgi_extension .py;");
+	checkThrows([&] { parseDirectives("cgi_extension .py;"); }, "extension without interpreter is rejected");
+	checkThrows([&] { parseDirectives("cgi_path " + interpreter + ";"); }, "interpreter without extension is rejected");
+	checkThrows([&] { parseDirectives("cgi_extension .py .sh; cgi_path " + interpreter + ";"); }, "mismatched CGI pairs are rejected");
+	checkThrows([&] { parseDirectives("cgi_path " + interpreter + "; cgi_extension .py .sh;"); }, "mismatched CGI pairs in reverse order are rejected");
+	checkThrows([&] { parseDirectives("cgi_extension .py; cgi_path " + base + "/missing;"); }, "missing CGI interpreter is rejected");
+	checkThrows([&] { parseDirectives("cgi_extension .py; cgi_path " + base + ";"); }, "directory used as interpreter is rejected");
+	checkThrows([&] { parseDirectives("cgi_extension .; cgi_path " + interpreter + ";"); }, "empty CGI extension suffix is rejected");
+	checkThrows([&] { parseDirectives("cgi_extension .py .py; cgi_path " + interpreter + " " + interpreter + ";"); }, "ambiguous duplicate CGI extensions are rejected");
+	chmod(interpreter.c_str(), 0600);
+	checkThrows([&] { parseDirectives("cgi_extension .py; cgi_path " + interpreter + ";"); }, "non-executable interpreter is rejected");
+	unlink(config.c_str());
+	unlink(interpreter.c_str());
+	rmdir(directory);
+}
+
+void testCgiRoutingAndMissingUploadStore()
+{
+	char directoryTemplate[] = "/tmp/webserv-cgi-route-XXXXXX";
+	char* directory = mkdtemp(directoryTemplate);
+	check(directory != NULL, "CGI route fixture directory is created");
+	if (!directory)
+		return;
+	const std::string base(directory);
+	std::ofstream(base + "/existing.py") << "print('Content-Type: text/plain\\n\\nOK')\n";
+	mkdir((base + "/directory.py").c_str(), 0700);
+	const LocationConfig* matchedLocation;
+	LocationConfig location;
+	location.setUriPath("/cgi-bin");
+	location.setRoot({base});
+	location.setAllowMethods({"GET", "POST"});
+	location.setCgiExtension({".py"});
+	location.setCgiPath({"/bin/sh"});
+	location.validateCgiConfig();
+	ServerConfig server;
+	server.addLocation(location);
+	LocationConfig normalLocation;
+	normalLocation.setUriPath("/cgi-bin");
+	normalLocation.setRoot({base});
+	normalLocation.setAllowMethods({"GET", "POST"});
+	server.addLocation(normalLocation);
+	for (const std::string method : {"GET", "POST"}) {
+		for (const std::string name : {"missing.py", "directory.py"}) {
+			const std::string raw = method + " /cgi-bin/" + name + " HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+			HTTPRequest request = HTTPRequestParser().parse(raw, raw.size());
+			CgiRoute route;
+			int error = 0;
+			check(!HTTPResponseBuild::resolveCgiRoute(request, server, route, error, matchedLocation) && error == 404,
+				method + " absent/non-file CGI script produces 404 without falling through");
+		}
+	}
+	std::string requestBuffer;
+	const auto requestFor = [&requestBuffer](const std::string& path) {
+		requestBuffer = "POST " + path + " HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+		return HTTPRequestParser().parse(requestBuffer, requestBuffer.size());
+	};
+	CgiRoute route;
+	int error = 999;
+	check(HTTPResponseBuild::resolveCgiRoute(requestFor("/cgi-bin/existing.py"), server, route, error, matchedLocation)
+		&& error == 0, "existing CGI accepts POST without upload_store");
+	check(!HTTPResponseBuild::resolveCgiRoute(requestFor("/cgi-bin/plain.txt"), server, route, error, matchedLocation)
+		&& error == 0, "ordinary URL is distinguished from missing CGI script");
+	check(HTTPResponseBuild::build(requestFor("/cgi-bin/plain.txt"), server).getStatusCode() == 403,
+		"ordinary POST without upload_store is forbidden, not a server failure");
+	LocationConfig getOnly;
+	getOnly.setUriPath("/get-only");
+	getOnly.setAllowMethods({"GET"});
+	server.addLocation(getOnly);
+	check(HTTPResponseBuild::build(requestFor("/get-only/file"), server).getStatusCode() == 405,
+		"disallowed POST retains 405 even without upload_store");
+	LocationConfig redirect;
+	redirect.setUriPath("/redirect");
+	redirect.setCgiExtension({".py"});
+	redirect.setCgiPath({"/bin/sh"});
+	redirect.setRedirect({"301", "/new"});
+	server.addLocation(redirect);
+	check(!HTTPResponseBuild::resolveCgiRoute(requestFor("/redirect/missing.py"), server, route, error, matchedLocation)
+		&& error == 0, "redirect is not mistaken for missing CGI");
+	check(HTTPResponseBuild::build(requestFor("/redirect/missing.py"), server).getStatusCode() == 301,
+		"redirect works without upload_store");
+	unlink((base + "/existing.py").c_str());
+	rmdir((base + "/directory.py").c_str());
+	rmdir(directory);
 }
 
 void testHttpRequestParser()
@@ -1427,6 +1534,1060 @@ void testClientHeaderSizeLimit()
 	}
 }
 
+void testClientCgiInitialState()
+{
+    Client client(42, 7);
+
+    check(
+        client.getCgiState() == CGI_NONE,
+        "new client starts with CGI_NONE"
+    );
+
+    check(
+        client.getCgiInputFd() == -1,
+        "new client has no CGI input fd"
+    );
+
+    check(
+        client.getCgiOutputFd() == -1,
+        "new client has no CGI output fd"
+    );
+
+    check(
+        client.getCgiInputOffset() == 0,
+        "new client CGI input offset starts at zero"
+    );
+
+    check(
+        client.getCgiOutput().empty(),
+        "new client CGI output starts empty"
+    );
+
+    check(
+        client.getCgiPid() == -1,
+        "new client has no CGI child PID"
+    );
+
+    check(
+        client.getCgiProcessFailed() == false,
+        "new client CGI failure flag starts false"
+    );
+
+    check(
+        client.getPendingRemoval() == false,
+        "new client is not pending removal"
+    );
+}
+
+void testClientCgiResetForNewRequest()
+{
+    Client client(42, 7);
+
+    client.setCgiState(CGI_READING);
+    client.setCgiInputFd(10);
+    client.setCgiOutputFd(11);
+    client.setCgiInputOffset(25);
+    client.setCgiOutput("old CGI output");
+    client.setCgiProcessFailed(true);
+
+    pid_t oldPid = 12345;
+    client.setCgiPid(oldPid);
+
+    client.resetCgiForNewRequest();
+
+    check(
+        client.getCgiState() == CGI_NONE,
+        "CGI reset returns state to CGI_NONE"
+    );
+
+    check(
+        client.getCgiInputFd() == -1,
+        "CGI reset clears input fd"
+    );
+
+    check(
+        client.getCgiOutputFd() == -1,
+        "CGI reset clears output fd"
+    );
+
+    check(
+        client.getCgiInputOffset() == 0,
+        "CGI reset clears input offset"
+    );
+
+    check(
+        client.getCgiOutput().empty(),
+        "CGI reset clears previous CGI output"
+    );
+
+    check(
+        client.getCgiProcessFailed() == false,
+        "CGI reset clears previous process failure"
+    );
+
+    check(
+        client.getCgiPid() == oldPid,
+        "CGI reset does not overwrite an unreaped child PID"
+    );
+}
+
+void testDecideConnectionHttp11Default()
+{
+    HTTPRequest request;
+
+    request.setVersion("1.1");
+
+    check(
+        HTTPResponseBuild::decideConnection(request) == "keep-alive",
+        "HTTP/1.1 defaults to keep-alive"
+    );
+}
+
+void testDecideConnectionHttp11Close()
+{
+    HTTPRequest request;
+
+    request.setVersion("1.1");
+    request.addHeader("connection", "close");
+
+    check(
+        HTTPResponseBuild::decideConnection(request) == "close",
+        "HTTP/1.1 Connection: close is respected"
+    );
+}
+
+void testDecideConnectionHttp10Default()
+{
+    HTTPRequest request;
+
+    request.setVersion("1.0");
+
+    check(
+        HTTPResponseBuild::decideConnection(request) == "close",
+        "HTTP/1.0 defaults to close"
+    );
+}
+
+void testDecideConnectionHttp10KeepAlive()
+{
+    HTTPRequest request;
+
+    request.setVersion("1.0");
+    request.addHeader("connection", "keep-alive");
+
+    check(
+        HTTPResponseBuild::decideConnection(request) == "keep-alive",
+        "HTTP/1.0 Connection: keep-alive is respected"
+    );
+}
+
+void testDecideConnectionUnknownVersion()
+{
+    HTTPRequest request;
+
+    request.setVersion("2.0");
+
+    check(
+        HTTPResponseBuild::decideConnection(request) == "close",
+        "Unknown HTTP version defaults to close"
+    );
+}
+
+void testCgiResponseHttp10ConnectionClose()
+{
+    HTTPRequest request;
+    request.setVersion("1.0");
+
+    CgiResult result;
+    result.valid = true;
+    result.statusCode = 200;
+    result.headers["content-type"] = "text/plain";
+    result.body = "Hello CGI";
+
+    ServerManager manager;
+
+    std::string response =
+        manager.buildCgiResponse(result, request);
+
+    check(
+        response.find("HTTP/1.0 200 OK\r\n") == 0,
+        "CGI response uses request HTTP version"
+    );
+
+    check(
+        response.find("Connection: close\r\n")
+            != std::string::npos,
+        "CGI HTTP/1.0 response defaults to Connection: close"
+    );
+}
+
+void testCgiResponseIgnoresCgiConnectionHeader()
+{
+    HTTPRequest request;
+
+    request.setVersion("1.1");
+
+    CgiResult result;
+    result.valid = true;
+    result.statusCode = 200;
+    result.headers["content-type"] = "text/plain";
+
+    // CGI tries to decide connection itself.
+    result.headers["connection"] = "close";
+
+    result.body = "Hello CGI";
+
+    ServerManager manager;
+
+    std::string response =
+        manager.buildCgiResponse(result, request);
+
+    check(
+        response.find("Connection: keep-alive\r\n")
+            != std::string::npos,
+        "Webserv controls CGI Connection header"
+    );
+
+    size_t first =
+        response.find("Connection:");
+
+    size_t second =
+        response.find("Connection:", first + 1);
+
+    check(
+        second == std::string::npos,
+        "CGI response contains only one Connection header"
+    );
+}
+
+
+void testRequestHeaderEdgeCases()
+{
+    {
+        Client client(42, 7);
+        const std::string request =
+            "GET / HTTP/1.1\r\n"
+            "\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::BadRequest,
+              "HTTP/1.1 request without Host is rejected");
+        check(client.getRequestErrorCode() == 400,
+              "missing HTTP/1.1 Host returns 400");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Content-Length: 5\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "Hello";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::BadRequest,
+              "duplicate Content-Length is rejected");
+        check(client.getRequestErrorCode() == 400,
+              "duplicate Content-Length returns 400");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Content-Length: 5\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::BadRequest,
+              "Content-Length plus Transfer-Encoding is rejected");
+        check(client.getRequestErrorCode() == 400,
+              "ambiguous request framing returns 400");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Transfer-Encoding: gzip\r\n"
+            "\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::BadRequest,
+              "unsupported Transfer-Encoding is rejected");
+        check(client.getRequestErrorCode() == 501,
+              "unsupported Transfer-Encoding returns 501");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "GET / HTTP/1.1\r\n"
+            "Host: first.test\r\n"
+            "Host: second.test\r\n"
+            "\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::BadRequest,
+              "duplicate Host header is rejected");
+        check(client.getRequestErrorCode() == 400,
+              "duplicate Host returns 400");
+    }
+}
+
+void testRequestBodyEdgeCases()
+{
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Content-Length: 6\r\n"
+            "\r\n"
+            "Hello";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::Complete,
+              "partial Content-Length headers are parsed");
+        check(client.checkRequestState(1024) == RequestState::Incomplete,
+              "partial Content-Length body remains incomplete");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Content-Length: 11\r\n"
+            "\r\n"
+            "Hello World";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::Complete,
+              "oversized Content-Length fixture headers are parsed");
+        check(client.checkRequestState(10) == RequestState::BadRequest,
+              "Content-Length above configured maximum is rejected");
+        check(client.getRequestErrorCode() == 413,
+              "oversized Content-Length returns 413");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "B\r\n"
+            "Hello World\r\n"
+            "0\r\n\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::Complete,
+              "oversized chunked fixture headers are parsed");
+        check(client.checkRequestState(10) == RequestState::BadRequest,
+              "decoded chunked body above configured maximum is rejected");
+        check(client.getRequestErrorCode() == 413,
+              "oversized chunked body returns 413");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "XYZ\r\n"
+            "Hello\r\n"
+            "0\r\n\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::Complete,
+              "malformed chunk fixture headers are parsed");
+        check(client.checkRequestState(1024) == RequestState::BadRequest,
+              "non-hexadecimal chunk size is rejected");
+    }
+
+    {
+        Client client(42, 7);
+        const std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: unit.test\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "5\r\n"
+            "HelloXX"
+            "0\r\n\r\n";
+        client.appendToRequestBuffer(request.data(), request.size());
+        check(client.parseHeaderClient() == RequestState::Complete,
+              "bad chunk terminator fixture headers are parsed");
+        check(client.checkRequestState(1024) == RequestState::BadRequest,
+              "chunk without CRLF terminator is rejected");
+    }
+}
+
+void testHttpProtocolEdgeCases()
+{
+    HTTPRequestParser parser;
+
+    {
+        const std::string raw =
+            "GET / HTTP/2.0\r\n"
+            "Host: unit.test\r\n\r\n";
+        try {
+            parser.parse(raw, raw.size());
+            check(false, "HTTP/2.0 request is rejected");
+        } catch (const HTTPParseException& e) {
+            check(e.getStatusCode() == 505,
+                  "unsupported HTTP version returns 505");
+        }
+    }
+
+    {
+        const std::string raw =
+            "PUT / HTTP/1.1\r\n"
+            "Host: unit.test\r\n\r\n";
+        HTTPRequest request = parser.parse(raw, raw.size());
+        check(request.getMethod() == Method::UNKNOWN,
+              "unsupported method parses as UNKNOWN");
+
+        ServerConfig server;
+        LocationConfig location;
+        location.setUriPath("/");
+        location.setAllowMethods(std::vector<std::string>{"GET"});
+        server.addLocation(location);
+
+        HTTPResponse response = HTTPResponseBuild::build(request, server);
+        const std::string output = response.toString(response);
+        check(output.find("HTTP/1.1 501 Not Implemented\r\n") == 0,
+              "unsupported method returns 501");
+    }
+}
+
+void testRouteAndPathEdgeCases()
+{
+    {
+        ServerConfig server;
+        LocationConfig location;
+        location.setUriPath("/");
+        location.setAllowMethods(std::vector<std::string>{"GET"});
+        server.addLocation(location);
+
+        const std::string raw =
+            "POST / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Length: 0\r\n\r\n";
+        HTTPRequest request = HTTPRequestParser().parse(raw, raw.size());
+        HTTPResponse response = HTTPResponseBuild::build(request, server);
+        const std::string output = response.toString(response);
+
+        check(output.find("HTTP/1.1 405 Method Not Allowed\r\n") == 0,
+              "method forbidden by location returns 405");
+        check(output.find("Allow: GET\r\n") != std::string::npos,
+              "405 response contains Allow header");
+    }
+
+    {
+        ServerConfig server;
+        LocationConfig location;
+        location.setUriPath("/");
+        location.setAllowMethods(std::vector<std::string>{"GET"});
+        server.addLocation(location);
+
+        const std::string raw =
+            "GET /../secret HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n";
+        HTTPRequest request = HTTPRequestParser().parse(raw, raw.size());
+        HTTPResponse response = HTTPResponseBuild::build(request, server);
+        const std::string output = response.toString(response);
+        check(output.find("HTTP/1.1 403 Forbidden\r\n") == 0,
+              "parent-directory traversal is rejected with 403");
+    }
+
+    {
+        ServerConfig server;
+        LocationConfig location;
+        location.setUriPath("/");
+        location.setAllowMethods(std::vector<std::string>{"GET"});
+        server.addLocation(location);
+
+        const std::string raw =
+            "GET /bad%2 HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n";
+        HTTPRequest request = HTTPRequestParser().parse(raw, raw.size());
+        HTTPResponse response = HTTPResponseBuild::build(request, server);
+        const std::string output = response.toString(response);
+        check(output.find("HTTP/1.1 400 Bad Request\r\n") == 0,
+              "invalid percent encoding returns 400");
+    }
+
+    {
+        ServerConfig server;
+        LocationConfig shortLocation;
+        shortLocation.setUriPath("/api");
+        shortLocation.setAllowMethods(std::vector<std::string>{"GET"});
+        LocationConfig longLocation;
+        longLocation.setUriPath("/api/private");
+        longLocation.setAllowMethods(std::vector<std::string>{"POST"});
+        server.addLocation(shortLocation);
+        server.addLocation(longLocation);
+
+        const std::string longRaw =
+            "GET /api/private/item HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n";
+        HTTPRequest longRequest = HTTPRequestParser().parse(longRaw, longRaw.size());
+        HTTPResponse longResponse = HTTPResponseBuild::build(longRequest, server);
+        const std::string longOutput = longResponse.toString(longResponse);
+        check(longOutput.find("HTTP/1.1 405 Method Not Allowed\r\n") == 0,
+              "longest matching location is selected");
+        check(longOutput.find("Allow: POST\r\n") != std::string::npos,
+              "longest location contributes its method policy");
+
+        const std::string prefixRaw =
+            "GET /apix HTTP/1.1\r\n"
+            "Host: localhost\r\n\r\n";
+        HTTPRequest prefixRequest = HTTPRequestParser().parse(prefixRaw, prefixRaw.size());
+        HTTPResponse prefixResponse = HTTPResponseBuild::build(prefixRequest, server);
+        const std::string prefixOutput = prefixResponse.toString(prefixResponse);
+        check(prefixOutput.find("HTTP/1.1 404 Not Found\r\n") == 0,
+              "location /api does not falsely match /apix");
+    }
+}
+
+void testServerConfigBodySizeEdgeCases()
+{
+    ServerConfig server;
+
+    checkThrows([&server] {
+        server.setClientMaxBodySize(std::vector<std::string>{"abc"});
+    }, "non-numeric client_max_body_size is rejected");
+
+    checkThrows([&server] {
+        server.setClientMaxBodySize(std::vector<std::string>{"10", "20"});
+    }, "multiple client_max_body_size values are rejected");
+}
+
+void testInvalidChunkSizePlusSign() {
+
+	Client client;
+
+	std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"\r\n"
+		"+5\r\n"
+		"Hello\r\n"
+		"0\r\n"
+		"\r\n";
+
+	client.appendToRequestBuffer(request.c_str(), request.size());
+
+	bool result = client.decodeChunkedBody();
+
+	if (result)
+		throw std::runtime_error("Chunk size with leading '+' was accepted");
+}
+
+void testInvalidChunkSize0xPrefix() {
+
+	Client client;
+
+	std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"\r\n"
+		"0x5\r\n"
+		"Hello\r\n"
+		"0\r\n"
+		"\r\n";
+
+	client.appendToRequestBuffer(request.c_str(), request.size());
+
+	bool result = client.decodeChunkedBody();
+
+	if (result)
+		throw std::runtime_error("Chunk size with 0x prefix was accepted");
+}
+
+void testMultipartLowercaseContentDisposition() {
+
+	std::string body =
+		"--AaB03x\r\n"
+		"content-disposition: form-data; name=\"file\"; filename=\"case.txt\"\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"hello\r\n"
+		"--AaB03x--\r\n";
+
+	MultipartParser parser(body, 0, body.size(), "AaB03x");
+
+	std::vector<MultipartPart> parts = parser.parse();
+
+	if (parts.size() != 1)
+		throw std::runtime_error("Lowercase content-disposition header was not parsed");
+
+	if (parts[0].getFilename() != "case.txt")
+		throw std::runtime_error("Filename from lowercase content-disposition was not parsed");
+}
+
+void testQuotedMultipartBoundary() {
+
+	HTTPRequestParser parser;
+
+	std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Type: multipart/form-data; boundary=\"AaB03x\"\r\n"
+		"Content-Length: 0\r\n"
+		"\r\n";
+
+	HTTPRequest parsed = parser.parse(request, request.size());
+
+	if (parsed.getBoundary() != "AaB03x")
+		throw std::runtime_error("Quoted multipart boundary was not normalized correctly");
+}
+
+void testMultipartBoundaryPrefixInsideData() {
+
+	std::string body =
+		"--BOUNDARY\r\n"
+		"Content-Disposition: form-data; name=\"file\"; filename=\"data.txt\"\r\n"
+		"Content-Type: text/plain\r\n"
+		"\r\n"
+		"first line\r\n"
+		"--BOUNDARYXYZ\r\n"
+		"still file data\r\n"
+		"--BOUNDARY--\r\n";
+
+	MultipartParser parser(body, 0, body.size(), "BOUNDARY");
+
+	std::vector<MultipartPart> parts = parser.parse();
+
+	if (parts.size() != 1)
+		throw std::runtime_error("Boundary-like file data confused multipart parser");
+
+	std::string expected =
+		"first line\r\n"
+		"--BOUNDARYXYZ\r\n"
+		"still file data";
+
+    std::string actualData = body.substr(
+        parts[0].getDataOffset(),
+        parts[0].getDataSize()
+    );
+
+	if (actualData != expected)
+		throw std::runtime_error("Multipart payload was truncated by boundary prefix");
+}
+
+ void testRawUploadFilenameUniqueness() {
+
+	char temporaryDirectory[] = "/tmp/webserv-upload-unique-XXXXXX";
+	char* uploadStore = mkdtemp(temporaryDirectory);
+
+	if (uploadStore == NULL)
+		throw std::runtime_error("mkdtemp failed");
+
+	ServerConfig server;
+	server.setRoot({"./site/www"});
+
+	LocationConfig location;
+	location.setUriPath("/upload");
+	location.setRoot({"./site/www/upload"});
+	location.setUploadStore({uploadStore});
+	location.setAllowMethods({"POST"});
+
+	server.addLocation(location);
+
+	HTTPRequest request1;
+	HTTPRequest request2;
+	request1.setVersion("1.1");
+	request2.setVersion("1.1");
+	
+	request1.setMethod(Method::POST);
+	request1.setPath("/upload");
+    std::string buffer1 = "one";
+    request1.setBodyLocation(buffer1, 0, buffer1.size());
+
+
+	request2.setMethod(Method::POST);
+	request2.setPath("/upload");
+	std::string buffer2 = "two";
+    request2.setBodyLocation(buffer2, 0, buffer2.size());
+
+	HTTPResponseBuild::build(request1, server);
+	HTTPResponseBuild::build(request2, server);
+
+	DIR* dir = opendir(uploadStore);
+
+	if (dir == NULL)
+		throw std::runtime_error("Could not open upload directory");
+
+	int fileCount = 0;
+
+	struct dirent* entry;
+
+	while ((entry = readdir(dir)) != NULL) {
+
+		std::string name = entry->d_name;
+
+		if (name != "." && name != "..")
+			++fileCount;
+	}
+
+	closedir(dir);
+
+	if (fileCount < 2)
+		throw std::runtime_error("Two uploads created the same filename");
+}
+
+void testEncodedPathTraversal() {
+
+	ServerConfig server;
+	server.setRoot({"./site/www"});
+
+	HTTPRequest request;
+	request.setVersion("1.1");
+	request.setMethod(Method::GET);
+	request.setPath("/%2e%2e/secret.txt");
+
+	HTTPResponse response = HTTPResponseBuild::build(request, server);
+
+	if (response.getStatusCode() != 403)
+		throw std::runtime_error("Encoded path traversal was not rejected with 403");
+}
+
+void testContentLengthPipelining() {
+
+	Client client;
+
+	std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Length: 5\r\n"
+		"\r\n"
+		"hello"
+		"GET / HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"\r\n";
+
+	client.appendToRequestBuffer(request.c_str(), request.size());
+
+	RequestState state = client.checkRequestState(1024);
+
+	if (state != RequestState::Complete)
+		throw std::runtime_error("First pipelined request was not recognized as complete");
+
+	if (client.getRequestEnd() == request.size())
+		throw std::runtime_error("Pipelined second request was consumed with first request");
+}
+
+void testUnsupportedMethodToCgiReturns501()
+{
+	char directoryTemplate[] = "/tmp/webserv-cgi-put-XXXXXX";
+	char* directory = mkdtemp(directoryTemplate);
+
+	check(directory != NULL, "CGI PUT fixture directory is created");
+	if (directory == NULL)
+		return;
+
+	const std::string base(directory);
+
+	std::ofstream(base + "/existing.py")
+		<< "print('Content-Type: text/plain\\n\\nOK')\n";
+
+	LocationConfig location;
+	location.setUriPath("/cgi-bin");
+	location.setRoot({base});
+	location.setAllowMethods({"GET", "POST"});
+	location.setCgiExtension({".py"});
+	location.setCgiPath({"/bin/sh"});
+	location.validateCgiConfig();
+
+	ServerConfig server;
+	server.addLocation(location);
+
+	const std::string raw =
+		"PUT /cgi-bin/existing.py HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Length: 0\r\n"
+		"\r\n";
+
+	HTTPRequest request =
+		HTTPRequestParser().parse(raw, raw.size());
+
+	check(
+		request.getMethod() == Method::UNKNOWN,
+		"unsupported CGI PUT method parses as UNKNOWN"
+	);
+
+	HTTPResponse response =
+		HTTPResponseBuild::makeEarlyErrorResponse(
+			501,
+			server
+		);
+
+	const std::string output =
+		response.toString(response);
+
+	check(
+		output.find("HTTP/1.1 501 Not Implemented\r\n") == 0,
+		"unsupported method to CGI URI returns 501"
+	);
+
+	unlink((base + "/existing.py").c_str());
+	rmdir(directory);
+}
+
+void testCgi405IncludesAllowHeader()
+{
+	char directoryTemplate[] = "/tmp/webserv-cgi-405-XXXXXX";
+	char* directory = mkdtemp(directoryTemplate);
+
+	check(directory != NULL, "CGI 405 fixture directory is created");
+	if (directory == NULL)
+		return;
+
+	const std::string base(directory);
+
+	std::ofstream(base + "/existing.py")
+		<< "print('Content-Type: text/plain\\n\\nOK')\n";
+
+	LocationConfig location;
+	location.setUriPath("/cgi-bin");
+	location.setRoot({base});
+	location.setAllowMethods({"GET", "POST"});
+	location.setCgiExtension({".py"});
+	location.setCgiPath({"/bin/sh"});
+	location.validateCgiConfig();
+
+	ServerConfig server;
+	server.addLocation(location);
+
+	const std::string raw =
+		"DELETE /cgi-bin/existing.py HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"\r\n";
+
+	HTTPRequest request =
+		HTTPRequestParser().parse(raw, raw.size());
+
+	CgiRoute route;
+	int error = 0;
+	const LocationConfig* matchedLocation = NULL;
+
+	bool isCgi = HTTPResponseBuild::resolveCgiRoute(
+		request,
+		server,
+		route,
+		error,
+		matchedLocation
+	);
+
+	check(
+		!isCgi && error == 405,
+		"disallowed CGI method produces 405"
+	);
+
+	check(
+		matchedLocation != NULL,
+		"CGI 405 preserves the matched location"
+	);
+
+	if (error == 405 && matchedLocation != NULL) {
+
+		HTTPResponse response =
+			HTTPResponseBuild::makeEarlyErrorResponse(
+				405,
+				server
+			);
+
+		response.setHeader(
+			"Allow",
+			HTTPResponseBuild::buildAllowHeader(*matchedLocation)
+		);
+
+		const std::string output =
+			response.toString(response);
+
+		check(
+			output.find("HTTP/1.1 405 Method Not Allowed\r\n") == 0,
+			"CGI disallowed method builds 405 response"
+		);
+
+		check(
+			output.find("Allow: GET, POST\r\n") != std::string::npos,
+			"CGI 405 response includes configured Allow header"
+		);
+	}
+
+	unlink((base + "/existing.py").c_str());
+	rmdir(directory);
+}
+
+void testLocationBodySizeConfig()
+{
+	LocationConfig location;
+
+	check(
+		!location.hasClientMaxBodySize(),
+		"new location has no client_max_body_size override"
+	);
+
+	location.setClientMaxBodySize(
+		std::vector<std::string>(1, "100")
+	);
+
+	check(
+		location.hasClientMaxBodySize(),
+		"location remembers that client_max_body_size was configured"
+	);
+
+	check(
+		location.getClientMaxBodySize() == 100,
+		"location stores client_max_body_size 100"
+	);
+}
+
+void testLocationBodySizeEdgeCases()
+{
+	{
+		LocationConfig location;
+
+		try {
+			location.setClientMaxBodySize(
+				std::vector<std::string>(1, "abc")
+			);
+
+			check(
+				false,
+				"non-numeric location client_max_body_size is rejected"
+			);
+		}
+		catch (const std::exception&) {
+			check(
+				true,
+				"non-numeric location client_max_body_size is rejected"
+			);
+		}
+	}
+
+	{
+		LocationConfig location;
+
+		std::vector<std::string> values;
+		values.push_back("10");
+		values.push_back("20");
+
+		try {
+			location.setClientMaxBodySize(values);
+
+			check(
+				false,
+				"multiple location client_max_body_size values are rejected"
+			);
+		}
+		catch (const std::exception&) {
+			check(
+				true,
+				"multiple location client_max_body_size values are rejected"
+			);
+		}
+	}
+}
+
+void testLocationBodySizeLimit()
+{
+	Client client(42, 7);
+
+	const std::string body(101, 'A');
+
+	const std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Length: 101\r\n"
+		"\r\n"
+		+ body;
+
+	client.appendToRequestBuffer(
+		request.c_str(),
+		request.size()
+	);
+
+	check(
+		client.parseHeaderClient() == RequestState::Complete,
+		"location body-size test parses headers"
+	);
+
+	check(
+		client.checkRequestState(100) == RequestState::BadRequest,
+		"101-byte body is rejected by 100-byte location limit"
+	);
+
+	check(
+		client.getRequestErrorCode() == 413,
+		"location body-size overflow produces 413"
+	);
+}
+
+void testLocationBodySizeBoundary()
+{
+	Client client(42, 7);
+
+	const std::string body(100, 'A');
+
+	const std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Length: 100\r\n"
+		"\r\n"
+		+ body;
+
+	client.appendToRequestBuffer(
+		request.c_str(),
+		request.size()
+	);
+
+	check(
+		client.parseHeaderClient() == RequestState::Complete,
+		"location body-size boundary parses headers"
+	);
+
+	check(
+		client.checkRequestState(100) == RequestState::Complete,
+		"100-byte body is accepted by 100-byte location limit"
+	);
+}
+
+void testServerBodySizeLimit()
+{
+	Client client(42, 7);
+
+	const std::string body(101, 'A');
+
+	const std::string request =
+		"POST /upload HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Content-Length: 101\r\n"
+		"\r\n"
+		+ body;
+
+	client.appendToRequestBuffer(
+		request.c_str(),
+		request.size()
+	);
+
+	check(
+		client.parseHeaderClient() == RequestState::Complete,
+		"server body-size test parses headers"
+	);
+
+	check(
+		client.checkRequestState(1000) == RequestState::Complete,
+		"101-byte body is accepted by larger server limit"
+	);
+}
+
 } // namespace
 
 int main()
@@ -1435,6 +2596,8 @@ int main()
 	run("LocationConfig", testLocationConfig);
 	run("ServerConfig", testServerConfig);
 	run("ConfigParser", testConfigParser);
+	run("CGI configuration validation", testCgiConfigurationValidation);
+	run("CGI routing and missing upload store", testCgiRoutingAndMissingUploadStore);
 	run("HTTPRequestParser", testHttpRequestParser);
 	run("HTTPRequest body location", testHttpRequestBodyLocation);
 	run("POST upload", testPostUpload);
@@ -1443,7 +2606,7 @@ int main()
 	run("Client new response resets progress", testClientNewResponseResetsProgress);
 	run("Client header size limit", testClientHeaderSizeLimit);
 	run("Client close after response", testClientCloseAfterResponse);
-	run("Client chunked body decoding", testClientDecodeChunkedBody); // 
+	run("Client chunked body decoding", testClientDecodeChunkedBody);
 	run("Client Content-Length request", testClientContentLengthUnaffected);
 	run("Virtual host server configs", testVirtualHostServerConfigs);
 	run("Multiple server names", testMultipleServerNames);
@@ -1454,7 +2617,36 @@ int main()
 	run("Redirect", testRedirect);
 	run("Client activity initialized", testClientLastActivityInitialized);
 	run("Client activity updates", testClientLastActivityUpdates);
-
+	run("Client CGI initial state", testClientCgiInitialState);
+	run("Client CGI reset for new request", testClientCgiResetForNewRequest);
+	run("HTTP/1.1 default connection", testDecideConnectionHttp11Default);
+	run("HTTP/1.1 Connection close", testDecideConnectionHttp11Close);
+	run("HTTP/1.0 default connection", testDecideConnectionHttp10Default);
+	run("HTTP/1.0 Connection keep-alive", testDecideConnectionHttp10KeepAlive);
+	run("Unknown HTTP version connection", testDecideConnectionUnknownVersion);
+	run("CGI HTTP/1.0 response connection close", testCgiResponseHttp10ConnectionClose);
+	run("CGI ignores CGI-provided Connection header", testCgiResponseIgnoresCgiConnectionHeader);
+	run("Request header edge cases", testRequestHeaderEdgeCases);
+	run("Request body edge cases", testRequestBodyEdgeCases);
+	run("HTTP protocol edge cases", testHttpProtocolEdgeCases);
+	run("Route and path edge cases", testRouteAndPathEdgeCases);
+	run("ServerConfig body-size edge cases", testServerConfigBodySizeEdgeCases);
+	run("CGI 405 includes Allow header", testCgi405IncludesAllowHeader);
+	run("Unsupported CGI method returns 501", testUnsupportedMethodToCgiReturns501);
+    run("BREAKER chunk + sign", testInvalidChunkSizePlusSign);
+    run("BREAKER chunk 0x prefix", testInvalidChunkSize0xPrefix);
+    run("BREAKER multipart lowercase header", testMultipartLowercaseContentDisposition);
+    run("BREAKER quoted multipart boundary", testQuotedMultipartBoundary);
+    run("BREAKER multipart boundary prefix in data", testMultipartBoundaryPrefixInsideData);
+    run("BREAKER raw upload uniqueness", testRawUploadFilenameUniqueness);
+    run("BREAKER encoded traversal", testEncodedPathTraversal);
+    run("BREAKER pipelined Content-Length", testContentLengthPipelining);
+	run("Location body-size config", testLocationBodySizeConfig);
+	run("Location body-size edge cases", testLocationBodySizeEdgeCases);
+	run("Location body-size limit", testLocationBodySizeLimit);
+	run("Location body-size boundary", testLocationBodySizeBoundary);
+	run("Server body-size limit", testServerBodySizeLimit);
+	
 	if (g_failures != 0) {
 		std::cerr << g_failures << " assertion(s) failed\n";
 		return 1;

@@ -8,6 +8,7 @@
 #include "MultipartPart.hpp"
 #include "MultipartParser.hpp"
 #include <fstream>
+#include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <iostream>
@@ -19,9 +20,7 @@
 #include <algorithm>
 #include <dirent.h>
 #include <fcntl.h>
-#include <cerrno>
 #include <ctime>
-#include <filesystem>
 
 class HTTPResponseBuild {
 
@@ -30,14 +29,15 @@ class HTTPResponseBuild {
 		static HTTPResponse handlePost(const HTTPRequest& request, const ServerConfig& servConf, std::string path,  const LocationConfig *&location);
 		static HTTPResponse handleDelete(const HTTPRequest& request, const ServerConfig& servConf, std::string &path,  const LocationConfig *&location);
 
-		static std::string getStatusText(int code);
 		static std::string  buildErrorBody(int code, const ServerConfig& servConf);
+		static std::string makeFallBackErrorBody(int code);
 		static std::string joinPath(const std::string& root, const std::string& path);
 		static bool fileExists(const std::string& file);
 		static bool canReadFile(const std::string& file);
 		static std::string readReadFile(const std::string& file);
 		static bool isDirectory(const std::string& path);
 		static std::string getContentType(const std::string& contenPath);
+		static std::string getPathExtension(const std::string& path);
 		static const LocationConfig* findBestLocation (const std::string& path,  const ServerConfig& servConf);
 		static std::string findIndexFile(std::string fullPath, const LocationConfig& location, const ServerConfig& servConf);
 		static bool startsWithLocation(const std::string& path, const std::string& loc);
@@ -47,18 +47,18 @@ class HTTPResponseBuild {
 		static bool pathInsideBase(const std::string& base, const std::string& target);
 		static std::string urlDecoder(std::string urlPath);
 		static int prepareRequestPath(const HTTPRequest &request, const ServerConfig &servConf, std::string &path, const LocationConfig *&location);
-
-		// DELETE 
-		// static std::string uploadStorePresent(const LocationConfig& location);
-		static std::string buildAllowHeader(const LocationConfig& location);
 		static bool deleteParentInsideBase(const std::string& base, const std::string& target);
-	
+		
 	public:
+		static const LocationConfig* getLocationForPath(const std::string& path, const ServerConfig& servConf);
+		static std::string buildAllowHeader(const LocationConfig& location);
+		static std::string getStatusText(int code);
 		static HTTPResponse build(const HTTPRequest& request, const ServerConfig& servConf);
 		static std::string decideConnection(const HTTPRequest& request);
 		static HTTPResponse makeErrorResponse(int code, const HTTPRequest& request, const ServerConfig& servConf);
 		static HTTPResponse makeEarlyErrorResponse(int code, const ServerConfig& servConf);
-
+		static bool resolveCgiRoute(const HTTPRequest& request, const ServerConfig& servConf, 
+									CgiRoute& route, int& errorCode, const LocationConfig*& location);
 };
 
 #endif

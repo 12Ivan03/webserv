@@ -7,6 +7,7 @@
 #include <iostream>
 #include <cstring>
 #include <vector>
+#include <map>
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -14,35 +15,75 @@
 #include <netinet/in.h>
 #include <cerrno>
 #include <netdb.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <cstdlib>
+
+enum FdType
+{
+    FD_SERVER_SOCKET,
+    FD_CLIENT_SOCKET,
+    FD_CGI_INPUT,
+    FD_CGI_OUTPUT
+};
+
+struct FdInfo
+{
+    FdType type;
+    int clientFd;
+};
+
+struct CgiResult {
+	bool valid;
+	int statusCode;
+	std::map<std::string, std::string> headers;
+	std::string body;
+};
 
 class ServerManager {
-
 	private:
 		std::map<int, std::vector<ServerConfig>> _serversMap;
 		std::vector<int> _serverSockets;
 		std::vector<pollfd> _pollfds;
 		std::map<int, Client> _clients;
-		void setNonBlocking(int fd);
+		void setNonBlocking(int file);
 		int findServerFd(const std::string& host, int port) const;
 		int createListeningSockets(const ServerConfig& servers);
 		bool isServerSocket(int fd) const;
-		void acceptNewClient(int serverFd);
+		void acceptNewClient(int server);
 		bool readClientData(size_t index);
 		bool writeClientData(size_t index);
+		std::map<int, FdInfo> _fdInfo;
 
 		bool shouldKeepAlive(const HTTPRequest& request) const;
 		void removeClient(size_t index);
-		// bool sendWholeResponse(int clinetFd, const std::string& respone) const;
 		bool processRequestBuffer(size_t index);
 		RequestState getRequestState(Client& client, const ServerConfig*& serverConfig);
         void removeTimeOutClients();
+		bool startCgi(Client& client, const HTTPRequest& request, const CgiRoute& route, const ServerConfig& servConf);
+		std::vector<std::string> buildCgiEnvironment(const HTTPRequest& request, const ServerConfig& servConf);
+		bool writeToCgi(int fd, int clientFdInfo);
+		bool readFromCgi(int fd, int clientFdInfo);
+		void failCgi(Client& client);
+		CgiResult parseCgiOutput(const std::string& cgiOutput);
+		void checkCgiTimeouts();
+		void reapCgiChildern();
+		void finishCgiResponse(Client& client);
 
 	public: 
+		std::string buildCgiResponse(const CgiResult& result, const HTTPRequest &request);
 		void queueResponse(size_t index, Client& client, HTTPResponse& response);
 		const std::map<int, std::vector<ServerConfig>>& getServerManager() const;
 		const ServerConfig& getClientServerManager(int serverIndex, const std::string& host) const;
 		void initialize(const std::vector<ServerConfig>& servers);
 		void run();
+
+		void addFd(int fd, FdType type, int clientFd);
+		void removeFd(int fd);
+		void unregisterFd(int fd);
+		void setFdEvents(int fd, short events);
+
 };
 
 #endif

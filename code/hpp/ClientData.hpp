@@ -26,6 +26,14 @@ enum class BodyType {
 	Chunked
 };
 
+enum CgiState
+{
+	CGI_NONE,
+	CGI_WRITING,
+	CGI_READING,
+	CGI_WAITING_EXIT
+};
+
 class Client {
 
 	private:
@@ -33,7 +41,7 @@ class Client {
 		std::string _responseBuffer;
 		
 		std::string _body;
-		
+
 		size_t _responseSent;
 		int _client_fd;
 		int _server_fd;
@@ -48,13 +56,22 @@ class Client {
 		bool _closeAfterResoinse;
 		std::string _host;
 		std::chrono::steady_clock::time_point _lastActivity;
-		// HTTPResponse _response;
+
+		CgiState _cgiState;
+		int _cgiInputFd;
+		int _cgiOutputFd;
+		size_t _cgiInputOffset;
+		std::string _cgiOutput;
+		pid_t _cgiPid;
+		std::chrono::steady_clock::time_point _cgiStartTime;
+		bool _cgiProcessFailed;
+		bool _pendingRemoval;
+		std::string _requestUri;
 		
 		bool parseContentLength(const std::string& value, size_t& result) const;
 		bool parseHexSize(const std::string& value, size_t& result) const;
 		RequestState checkChunkedBody(size_t bodyStart, size_t& requestEnd, size_t& decodedBodySize, size_t maxBodySize);
 		std::string trim(const std::string& value) const;
-		// std::string toLower(const std::string& value) const;
 		RequestState checkChunkedRequestBody(size_t maxBodySize);
 		RequestState checkContentLengthBody();
 		RequestState setRequestError(int errorCode);
@@ -91,6 +108,28 @@ class Client {
 		const std::string& getHost() const;
 		void updateLastActivity();
 		const std::chrono::steady_clock::time_point& getLastActivity();
+
+		void resetCgiForNewRequest();
+		CgiState getCgiState() const;
+		int getCgiInputFd() const;
+		int getCgiOutputFd() const;
+		size_t getCgiInputOffset() const;
+		const std::string& getCgiOutput() const;
+		pid_t getCgiPid() const;
+		const std::chrono::steady_clock::time_point& getCgiTime();
+		bool getCgiProcessFailed() const;
+		bool getPendingRemoval() const;
+		const std::string& getRequestUri() const;
+
+		void setPendingRemoval(bool pending);
+		void setCgiProcessFailed(bool failed);
+		void setCgiStartTime();
+		void setCgiPid(pid_t cgiPid);
+		void setCgiState(CgiState state);
+		void setCgiInputFd(int fd);
+		void setCgiOutputFd(int fd);
+		void setCgiInputOffset(size_t offset);
+		void setCgiOutput(const std::string& output);
 		
 };
 

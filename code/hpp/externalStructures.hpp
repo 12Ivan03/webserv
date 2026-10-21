@@ -12,8 +12,8 @@ struct AllowMethods{
 };
 
 struct Redirection{
-	int	_number; // status 
-	std::string _redirPath; // - redirect for this error
+	int	_number;
+	std::string _redirPath;
 };
 
 enum class Method
@@ -30,6 +30,13 @@ enum BodyContentType
 	BODY_UNKNOWN,
 	BODY_MULTIPART,
 	BODY_RAW
+};
+
+struct CgiRoute
+{
+	std::string scriptPath;
+	std::string cgiPath;
+	std::string workingDirectory;
 };
 
 #endif

@@ -2,8 +2,8 @@ NAME		:= webserv
 TEST_NAME	:= webserv_tests
 
 CXX			:= c++
-CXXFLAGS	:= -Wall -Wextra -Werror -std=c++17
-CPPFLAGS	:= -Icode/hpp -g
+CXXFLAGS	:= -Wall -Wextra -Werror
+CPPFLAGS	:= -Icode/hpp -g -std=c++17
 
 OBJ_DIR		:= build
 
@@ -12,11 +12,10 @@ OBJ_DIR		:= build
 SRCS		:= main.cpp \
 			   code/ConfigParser.cpp \
 			   code/ServerManager.cpp \
+			   code/ServerManagerCGI.cpp \
 			   code/ServerConfig.cpp \
 			   code/LocationConfig.cpp \
-			   code/ErrorPages.cpp \
 			   code/HelperFunctions.cpp \
-			   code/printDebug.cpp \
 			   code/ClientData.cpp \
 			   code/ClientRequestParsing.cpp\
 			   code/HTTPRequest.cpp \
@@ -26,15 +25,15 @@ SRCS		:= main.cpp \
 			   code/HTTPParseException.cpp \
 			   code/MultipartPart.cpp \
 			   code/MultipartParser.cpp \
+# 			   code/printDebug.cpp \
 			   
 TEST_SRCS	:= tests/TestMain.cpp \
 			   code/ConfigParser.cpp \
 			   code/ServerManager.cpp \
+			   code/ServerManagerCGI.cpp \
 			   code/ServerConfig.cpp \
 			   code/LocationConfig.cpp \
-			   code/ErrorPages.cpp \
 			   code/HelperFunctions.cpp \
-			   code/printDebug.cpp \
 			   code/ClientData.cpp \
 			   code/ClientRequestParsing.cpp\
 			   code/HTTPRequest.cpp \
@@ -44,6 +43,7 @@ TEST_SRCS	:= tests/TestMain.cpp \
 			   code/HTTPParseException.cpp \
 			   code/MultipartPart.cpp \
 			   code/MultipartParser.cpp \
+# 			   code/printDebug.cpp \
 
 OBJS		:= $(SRCS:%.cpp=$(OBJ_DIR)/%.o)
 DEPS		:= $(OBJS:.o=.d)

@@ -1,5 +1,42 @@
 #include "./hpp/ClientData.hpp"
 
+static bool isValidHeaderName(const std::string& name)
+{
+	if (name.empty())
+		return false;
+
+	for (size_t i = 0; i < name.size(); ++i) {
+		unsigned char c = static_cast<unsigned char>(name[i]);
+
+		if (std::isalnum(c))
+			continue;
+
+		switch (c) {
+			case '!':
+			case '#':
+			case '$':
+			case '%':
+			case '&':
+			case '\'':
+			case '*':
+			case '+':
+			case '-':
+			case '.':
+			case '^':
+			case '_':
+			case '`':
+			case '|':
+			case '~':
+				continue;
+
+			default:
+				return false;
+		}
+	}
+
+	return true;
+}
+
 RequestState Client::parseHeaderClient() {
 
 	static const size_t MAX_HEADER_SIZE = 32 * 1024;
@@ -39,6 +76,8 @@ RequestState Client::parseHeaderClient() {
 	if (!(requestLine >> method >> uri >> version))
 		return setRequestError(400);
 
+	_requestUri = uri;
+
 	bool hasContentLength = false;
 	bool hasTransferEncoding = false;
 	bool hasHost = false;
@@ -57,8 +96,12 @@ RequestState Client::parseHeaderClient() {
 
 		if (colonmPosition == std::string::npos) 
 			return setRequestError(400);
+		
+		std::string rawHeaderName = line.substr(0, colonmPosition);
+		if (!isValidHeaderName(rawHeaderName))
+			return setRequestError(400);
 
-		std::string headerName = toLower(trim(line.substr(0, colonmPosition)));
+		std::string headerName = toLower(rawHeaderName);
 		std::string headerValue = trim(line.substr(colonmPosition + 1));
 
 		if (headerName.empty()) 
@@ -98,8 +141,6 @@ RequestState Client::parseHeaderClient() {
 				_host = headerValue;
 			else 
 				_host = headerValue.substr(0, colonPos);
-
-			// std::cout <<" _host : " << getHost() << std::endl;
 
 			hasHost = true;
 		}
@@ -153,8 +194,7 @@ RequestState Client::checkChunkedRequestBody(size_t maxBodySize) {
 		return chunkedState;
 
 	_requestEnd = checkedRequestEnd;
-	_bodySize = decodedBodySize; //-> size only info 
-	// _bodySize = _requestEnd - _bodyPos; // size info + protocol;
+	_bodySize = decodedBodySize;
 
 	return RequestState::Complete;
 };
@@ -268,6 +308,12 @@ bool Client::parseHexSize(const std::string& value, size_t& result) const {
 
 	if (value.empty())
 		return false;
+
+	for (size_t i = 0; i < value.size(); i++) {
+		unsigned char c = static_cast<unsigned char>(value[i]);
+		if (!std::isxdigit(c))
+			return false;
+	}
 
 	try {
 		size_t parsedCharacters = 0;
