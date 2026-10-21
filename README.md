@@ -264,4 +264,4 @@ AI output was treated as suggestions rather than authoritative answers. Proposed
 ## Team
 
 - **Ivan Pavlov** — Codam login: `ipavlov` — GitHub: `12Ivan03`
-- **Anastasia Erokhina** — Codam login: `agerokhina` — GitHub: `agerokhina`
+- **Alina Erokhina** — Codam login: `aerokhina` — GitHub: `aerokhina`
