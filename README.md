@@ -176,7 +176,9 @@ The actual default configuration is in [`config/default.conf`](config/default.co
 
 Common directives include `listen`, `server_name`, `root`, `index`, `allow_methods`, `autoindex`, `client_max_body_size`, `error_page`, `upload_store`, `cgi_extension`, `cgi_path`, and `return`.
 
-> The configured upload directory must exist before using uploads. CGI interpreters must be installed at the paths set in the configuration.
+> Note: The configured upload directory must exist before using uploads. CGI interpreters must be installed at the paths specified in the configuration.
+
+> JavaScript CGI: JavaScript CGI support is included in the project, but its configuration is commented out by default. To enable it, uncomment the corresponding CGI directives in config/default.conf and ensure that Node.js is installed and that cgi_path points to the correct executable.
 
 ## CGI: the interesting part
 
